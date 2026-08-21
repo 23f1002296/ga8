@@ -971,3 +971,365 @@ async def bqml(request: Request):
         content=bqml_json(result),
         media_type="application/json",
     )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic model-registry promotion gate
+# ---------------------------------------------------------------------------
+
+PROMOTE_ALIAS_STATE = {"version": None}
+
+
+def promote_json(obj):
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def promote_valid_safe_int(value, positive=False):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    if positive:
+        return 1 <= value <= SAFE_INT_MAX
+    return 0 <= value <= SAFE_INT_MAX
+
+
+def promote_valid_canonical_version(value):
+    if not isinstance(value, str):
+        return None
+    if not value or not re.fullmatch(r"[1-9][0-9]*", value):
+        return None
+    try:
+        num = int(value)
+    except ValueError:
+        return None
+    if num <= 0 or num > SAFE_INT_MAX:
+        return None
+    return str(num)
+
+
+def promote_rate(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    f = float(value)
+    if not math.isfinite(f):
+        return None
+    if not 0.0 <= f <= 1.0:
+        return None
+    return f
+
+
+def promote_parse_policy(policy):
+    if not isinstance(policy, dict):
+        return None, "INVALID_POLICY"
+
+    required_keys = {
+        "datasetDigest",
+        "schemaDigest",
+        "maxAgeSeconds",
+        "accuracyFloor",
+        "requiredSlices",
+        "maxLatencyMs",
+        "maxSizeBytes",
+        "minImprovement",
+    }
+    if not required_keys.issubset(policy.keys()):
+        return None, "INVALID_POLICY"
+
+    dataset_digest = policy.get("datasetDigest")
+    schema_digest = policy.get("schemaDigest")
+    if not isinstance(dataset_digest, str) or not dataset_digest:
+        return None, "INVALID_POLICY"
+    if not isinstance(schema_digest, str) or not schema_digest:
+        return None, "INVALID_POLICY"
+
+    max_age = policy.get("maxAgeSeconds")
+    if not promote_valid_safe_int(max_age, positive=False):
+        return None, "INVALID_POLICY"
+
+    accuracy_floor = promote_rate(policy.get("accuracyFloor"))
+    if accuracy_floor is None:
+        return None, "INVALID_POLICY"
+
+    required_slices = policy.get("requiredSlices")
+    if not isinstance(required_slices, dict):
+        return None, "INVALID_POLICY"
+
+    normalized_slices = {}
+    for name, floor in required_slices.items():
+        if not isinstance(name, str) or not name:
+            return None, "INVALID_POLICY"
+        val = promote_rate(floor)
+        if val is None:
+            return None, "INVALID_POLICY"
+        normalized_slices[name] = val
+
+    max_latency = policy.get("maxLatencyMs")
+    if isinstance(max_latency, bool) or not isinstance(max_latency, (int, float)):
+        return None, "INVALID_POLICY"
+    if not math.isfinite(float(max_latency)) or float(max_latency) < 0:
+        return None, "INVALID_POLICY"
+
+    max_size = policy.get("maxSizeBytes")
+    if not promote_valid_safe_int(max_size, positive=False):
+        return None, "INVALID_POLICY"
+
+    min_improvement = promote_rate(policy.get("minImprovement"))
+    if min_improvement is None:
+        return None, "INVALID_POLICY"
+
+    return {
+        "datasetDigest": dataset_digest,
+        "schemaDigest": schema_digest,
+        "maxAgeSeconds": int(max_age),
+        "accuracyFloor": accuracy_floor,
+        "requiredSlices": normalized_slices,
+        "maxLatencyMs": float(max_latency),
+        "maxSizeBytes": int(max_size),
+        "minImprovement": min_improvement,
+    }, None
+
+
+def promote_sort_codes(codes):
+    return sorted(set(codes), key=bqml_utf8)
+
+
+def promote_failed_gate_map(version_key, codes):
+    return codes
+
+
+@app.post("/promote")
+async def promote(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+
+    as_of_raw = body.get("asOf")
+    champion_raw = body.get("championVersion")
+    policy_raw = body.get("policy")
+    versions_raw = body.get("versions")
+
+    if not isinstance(champion_raw, str):
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+    if not isinstance(versions_raw, list):
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+    if not isinstance(policy_raw, dict):
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+    if parse_event_time(as_of_raw) is None:
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+
+    compact_result = {
+        "action": "block",
+        "championVersion": champion_raw,
+        "selectedVersion": None,
+        "eligibleVersions": [],
+        "failedGates": {},
+        "aliasMutation": None,
+        "evidence": None,
+    }
+
+    policy, policy_error = promote_parse_policy(policy_raw)
+    if policy_error is not None:
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+
+    as_of_dt = parse_event_time(as_of_raw)
+    assert as_of_dt is not None
+
+    failed_gates = {}
+    valid_versions = {}
+    seen_versions = set()
+
+    for item in versions_raw:
+        if not isinstance(item, dict):
+            key = "__invalid__"
+            failed_gates.setdefault(key, set()).add("INVALID_VERSION")
+            continue
+
+        version_raw = item.get("version")
+        version_key = version_raw if isinstance(version_raw, str) else str(version_raw)
+        norm_version = promote_valid_canonical_version(version_raw)
+        if norm_version is None:
+            failed_gates.setdefault(version_key if isinstance(version_raw, str) else "__invalid__", set()).add("INVALID_VERSION")
+            continue
+
+        if norm_version in seen_versions:
+            failed_gates.setdefault(norm_version, set()).add("DUPLICATE_VERSION")
+            continue
+        seen_versions.add(norm_version)
+        valid_versions[norm_version] = item
+
+    def add_gate(version_key, code):
+        failed_gates.setdefault(version_key, set()).add(code)
+
+    for version_str, item in valid_versions.items():
+        if not isinstance(item, dict):
+            add_gate(version_str, "INVALID_VERSION")
+            continue
+
+        evaluation = item.get("evaluation")
+        if not isinstance(evaluation, dict):
+            add_gate(version_str, "MISSING_EVALUATION")
+            continue
+
+        version_artifact = item.get("artifactDigest")
+        if not isinstance(version_artifact, str) or not version_artifact:
+            add_gate(version_str, "INVALID_VERSION")
+            continue
+
+        created_at = evaluation.get("createdAt")
+        created_dt = parse_event_time(created_at)
+        if created_dt is None:
+            add_gate(version_str, "INVALID_TIMESTAMP")
+            continue
+        if created_dt > as_of_dt:
+            add_gate(version_str, "FUTURE_EVALUATION")
+        if created_dt < as_of_dt - timedelta(seconds=int(policy["maxAgeSeconds"])):
+            add_gate(version_str, "STALE_EVALUATION")
+
+        accuracy = evaluation.get("accuracy")
+        acc_val = promote_rate(accuracy)
+        if acc_val is None:
+            add_gate(version_str, "NON_FINITE")
+        elif not 0.0 <= acc_val <= 1.0:
+            add_gate(version_str, "METRIC_RANGE")
+        if acc_val is not None and acc_val < policy["accuracyFloor"]:
+            add_gate(version_str, "ACCURACY_FLOOR")
+
+        latency = evaluation.get("latencyMs")
+        lat_val = None
+        if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+            add_gate(version_str, "NON_FINITE")
+        else:
+            if not math.isfinite(float(latency)) or float(latency) < 0:
+                add_gate(version_str, "NON_FINITE")
+            else:
+                lat_val = float(latency)
+                if lat_val > policy["maxLatencyMs"]:
+                    add_gate(version_str, "LATENCY_LIMIT")
+
+        size = evaluation.get("sizeBytes")
+        size_val = None
+        if isinstance(size, bool) or not isinstance(size, (int, float)):
+            add_gate(version_str, "NON_FINITE")
+        else:
+            if not math.isfinite(float(size)) or float(size) < 0:
+                add_gate(version_str, "NON_FINITE")
+            else:
+                size_val = float(size)
+                if size_val > policy["maxSizeBytes"]:
+                    add_gate(version_str, "SIZE_LIMIT")
+
+        eval_artifact = evaluation.get("artifactDigest")
+        if not isinstance(eval_artifact, str) or not eval_artifact:
+            add_gate(version_str, "ARTIFACT_MISMATCH")
+        elif eval_artifact != version_artifact:
+            add_gate(version_str, "ARTIFACT_MISMATCH")
+
+        eval_dataset = evaluation.get("datasetDigest")
+        if eval_dataset != policy["datasetDigest"]:
+            add_gate(version_str, "DATASET_MISMATCH")
+
+        eval_schema = evaluation.get("schemaDigest")
+        if eval_schema != policy["schemaDigest"]:
+            add_gate(version_str, "SCHEMA_MISMATCH")
+
+        slices = evaluation.get("slices")
+        if not isinstance(slices, dict):
+            for name in sorted(policy["requiredSlices"].keys(), key=bqml_utf8):
+                add_gate(version_str, f"MISSING_SLICE:{name}")
+        else:
+            for name, floor in sorted(policy["requiredSlices"].items(), key=lambda kv: bqml_utf8(kv[0])):
+                if name not in slices:
+                    add_gate(version_str, f"MISSING_SLICE:{name}")
+                    continue
+                value = slices[name]
+                val = promote_rate(value)
+                if val is None:
+                    add_gate(version_str, f"SLICE_RANGE:{name}")
+                    continue
+                if val < floor:
+                    add_gate(version_str, f"SLICE_FLOOR:{name}")
+
+    eligible = []
+    version_to_eval = {}
+    for version_str, item in valid_versions.items():
+        gates = promote_sort_codes(failed_gates.get(version_str, set()))
+        if not gates:
+            evaluation = item.get("evaluation")
+            if isinstance(evaluation, dict):
+                acc = promote_rate(evaluation.get("accuracy"))
+                lat = evaluation.get("latencyMs")
+                sz = evaluation.get("sizeBytes")
+                if acc is not None and lat is not None and sz is not None:
+                    if isinstance(lat, bool) or not isinstance(lat, (int, float)):
+                        continue
+                    if isinstance(sz, bool) or not isinstance(sz, (int, float)):
+                        continue
+                    if not math.isfinite(float(lat)) or not math.isfinite(float(sz)):
+                        continue
+                    version_to_eval[version_str] = evaluation
+                    eligible.append({
+                        "version": version_str,
+                        "accuracy": float(acc),
+                        "latency": float(lat),
+                        "size": float(sz),
+                        "evidence": evaluation,
+                    })
+
+    eligible.sort(key=lambda item: (-item["accuracy"], item["latency"], item["size"], int(item["version"])))
+
+    compact_result["eligibleVersions"] = [item["version"] for item in eligible]
+    for version_str in sorted(failed_gates.keys(), key=bqml_utf8):
+        compact_result["failedGates"][version_str] = promote_sort_codes(failed_gates[version_str])
+
+    champion_version = champion_raw
+    champion_data = None
+    champion_entry = valid_versions.get(champion_version)
+    champion_valid = champion_version in version_to_eval
+
+    if not champion_valid:
+        compact_result["action"] = "block"
+        compact_result["selectedVersion"] = None
+        compact_result["evidence"] = None
+        compact_result["aliasMutation"] = None
+        return Response(content=promote_json(compact_result), media_type="application/json")
+
+    champion_data = version_to_eval[champion_version]
+    if PROMOTE_ALIAS_STATE["version"] is not None and PROMOTE_ALIAS_STATE["version"] in version_to_eval and PROMOTE_ALIAS_STATE["version"] != champion_version:
+        selected = PROMOTE_ALIAS_STATE["version"]
+        compact_result["action"] = "retain"
+        compact_result["selectedVersion"] = selected
+        compact_result["evidence"] = version_to_eval[selected]
+        compact_result["aliasMutation"] = None
+        return Response(content=promote_json(compact_result), media_type="application/json")
+
+    challenger = None
+    for item in eligible:
+        if item["version"] == champion_version:
+            continue
+        challenger = item
+        break
+
+    if challenger is None:
+        compact_result["action"] = "retain"
+        compact_result["selectedVersion"] = champion_version
+        compact_result["evidence"] = champion_data
+        compact_result["aliasMutation"] = None
+        return Response(content=promote_json(compact_result), media_type="application/json")
+
+    improvement = round(challenger["accuracy"] - champion_data["accuracy"], 12)
+    if improvement >= policy["minImprovement"]:
+        compact_result["action"] = "promote"
+        compact_result["selectedVersion"] = challenger["version"]
+        compact_result["evidence"] = challenger["evidence"]
+        compact_result["aliasMutation"] = {"alias": "champion", "version": challenger["version"]}
+        PROMOTE_ALIAS_STATE["version"] = challenger["version"]
+    else:
+        compact_result["action"] = "retain"
+        compact_result["selectedVersion"] = champion_version
+        compact_result["evidence"] = champion_data
+        compact_result["aliasMutation"] = None
+
+    return Response(content=promote_json(compact_result), media_type="application/json")
