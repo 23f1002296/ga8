@@ -420,6 +420,14 @@ def bqml_json(obj):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
+def bqml_error(status_code: int, code: str):
+    return Response(
+        content=bqml_json({"error": code}),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
 def bqml_utf8(s):
     return s.encode("utf-8")
 
@@ -477,7 +485,10 @@ def bqml_valid_selection_row(row):
             return False
         if "value" not in feature or "availableAt" not in feature:
             return False
-        if bqml_time(feature["availableAt"]) is None:
+        available_at = bqml_time(feature["availableAt"])
+        if available_at is None:
+            return False
+        if available_at > prediction_dt:
             return False
 
     return True
@@ -791,9 +802,11 @@ def bqml_evaluate(body):
     selected = body.get("selectedTrialId") if isinstance(body, dict) else None
     bytes_processed = body.get("bytesProcessed") if isinstance(body, dict) else 0
 
+    digest = body.get("datasetDigest") if isinstance(body, dict) else None
     base = {
         "runId": run_id if isinstance(run_id, str) else "",
         "selectedTrialId": selected if bqml_valid_safe_int(selected) else None,
+        "datasetDigest": digest if isinstance(digest, str) else None,
         "testMetric": None,
         "criticalSlicePass": False,
         "decision": "reject",
@@ -804,6 +817,10 @@ def bqml_evaluate(body):
     if not bqml_valid_evaluate_input(body):
         base["reasonCodes"] = ["INVALID_INPUT"]
         return base
+
+    # Preserve the frozen selection digest in the response even when the
+    # evaluation fails lineage or gate checks.
+    base["datasetDigest"] = body["datasetDigest"]
 
     with BQML_LOCK:
         stored = BQML_RUNS.get(run_id)
@@ -899,24 +916,15 @@ async def bqml(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(
-            {"error": "INVALID_INPUT"},
-            status_code=400,
-        )
+        return bqml_error(400, "INVALID_INPUT")
 
     if not isinstance(body, dict):
-        return JSONResponse(
-            {"error": "INVALID_INPUT"},
-            status_code=400,
-        )
+        return bqml_error(400, "INVALID_INPUT")
 
     phase = body.get("phase")
 
     if phase not in ("select", "evaluate"):
-        return JSONResponse(
-            {"error": "INVALID_INPUT"},
-            status_code=400,
-        )
+        return bqml_error(400, "INVALID_INPUT")
 
     if phase == "select":
         run_id = body.get("runId")
@@ -934,10 +942,7 @@ async def bqml(request: Request):
                         media_type="application/json",
                     )
 
-                return JSONResponse(
-                    {"error": "RUN_ID_CONFLICT"},
-                    status_code=409,
-                )
+                return bqml_error(409, "RUN_ID_CONFLICT")
 
         result = bqml_build_selection(body)
         serialized = bqml_json(result)
