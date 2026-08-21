@@ -1111,7 +1111,15 @@ async def promote(request: Request):
     policy_raw = body.get("policy")
     versions_raw = body.get("versions")
 
-    if not isinstance(champion_raw, str):
+    champion_norm = None
+    if isinstance(champion_raw, bool):
+        champion_norm = None
+    elif isinstance(champion_raw, int):
+        champion_norm = promote_valid_canonical_version(str(champion_raw))
+    elif isinstance(champion_raw, str):
+        champion_norm = promote_valid_canonical_version(champion_raw)
+
+    if champion_norm is None:
         return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
     if not isinstance(versions_raw, list):
         return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
@@ -1120,6 +1128,7 @@ async def promote(request: Request):
     if parse_event_time(as_of_raw) is None:
         return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
 
+    champion_raw = champion_norm
     compact_result = {
         "action": "block",
         "championVersion": champion_raw,
@@ -1148,10 +1157,21 @@ async def promote(request: Request):
             continue
 
         version_raw = item.get("version")
-        version_key = version_raw if isinstance(version_raw, str) else str(version_raw)
-        norm_version = promote_valid_canonical_version(version_raw)
+        if isinstance(version_raw, bool):
+            version_key = "__invalid__"
+            norm_version = None
+        elif isinstance(version_raw, int):
+            version_key = str(version_raw)
+            norm_version = promote_valid_canonical_version(version_key)
+        elif isinstance(version_raw, str):
+            version_key = version_raw
+            norm_version = promote_valid_canonical_version(version_raw)
+        else:
+            version_key = "__invalid__"
+            norm_version = None
+
         if norm_version is None:
-            failed_gates.setdefault(version_key if isinstance(version_raw, str) else "__invalid__", set()).add("INVALID_VERSION")
+            failed_gates.setdefault(version_key if version_key != "__invalid__" else "__invalid__", set()).add("INVALID_VERSION")
             continue
 
         if norm_version in seen_versions:
