@@ -701,7 +701,6 @@ def bqml_build_selection(body):
 
     if "TRIAL_LIMIT_EXCEEDED" in reasons:
         result["reasonCodes"] = ["TRIAL_LIMIT_EXCEEDED"]
-        result["datasetDigest"] = None
         return result
 
     successful = [
@@ -786,9 +785,9 @@ def bqml_valid_test_row(row):
     if set(row.keys()) != {"label", "prediction", "slice"}:
         return False
 
-    if isinstance(row["label"], bool) or row["label"] not in (0, 1):
+    if type(row["label"]) is not int or row["label"] not in (0, 1):
         return False
-    if isinstance(row["prediction"], bool) or row["prediction"] not in (0, 1):
+    if type(row["prediction"]) is not int or row["prediction"] not in (0, 1):
         return False
     if not isinstance(row["slice"], str) or not row["slice"]:
         return False
