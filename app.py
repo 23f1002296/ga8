@@ -462,6 +462,8 @@ def bqml_valid_selection_row(row):
     prediction_dt = bqml_time(row["predictionTime"])
     if event_dt is None or prediction_dt is None:
         return False
+    if event_dt > prediction_dt:
+        return False
 
     if not bqml_valid_safe_int(row["version"]):
         return False
@@ -876,7 +878,7 @@ def bqml_evaluate(body):
         reasons.append("BYTE_LIMIT")
 
     # This field deliberately does not summarize aggregate or byte gates.
-    base["criticalSlicePass"] = slice_pass
+    base["criticalSlicePass"] = (lineage_ok and slice_pass)
     base["reasonCodes"] = bqml_codes(reasons)
 
     if (
