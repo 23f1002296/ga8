@@ -461,9 +461,9 @@ def bqml_valid_selection_row(row):
     }
     if set(row.keys()) != required:
         return False
-    if not isinstance(row["id"], str):
+    if not isinstance(row["id"], str) or not row["id"]:
         return False
-    if not isinstance(row["entity"], str):
+    if not isinstance(row["entity"], str) or not row["entity"]:
         return False
 
     event_dt = bqml_time(row["eventTime"])
@@ -481,7 +481,7 @@ def bqml_valid_selection_row(row):
         return False
 
     for name, feature in row["features"].items():
-        if not isinstance(name, str) or not isinstance(feature, dict):
+        if not isinstance(name, str) or not name or not isinstance(feature, dict):
             return False
         if "value" not in feature or "availableAt" not in feature:
             return False
@@ -671,9 +671,8 @@ def bqml_build_selection(body):
         "reasonCodes": reasons,
     }
 
-    # Any contract failure means the selection is malformed and must not
-    # produce a dataset digest or selected trial.
-    if reasons:
+    if "INVALID_INPUT" in reasons:
+        result["datasetDigest"] = None
         return result
 
     retained = bqml_deduplicate_rows(body["rows"])
@@ -700,6 +699,11 @@ def bqml_build_selection(body):
         feature_names,
     )
 
+    if "TRIAL_LIMIT_EXCEEDED" in reasons:
+        result["reasonCodes"] = ["TRIAL_LIMIT_EXCEEDED"]
+        result["datasetDigest"] = None
+        return result
+
     successful = [
         trial
         for trial in body["trials"]
@@ -709,11 +713,6 @@ def bqml_build_selection(body):
 
     if not successful:
         result["selectedTrialId"] = None
-        result["datasetDigest"] = bqml_digest(
-            train_ids,
-            eval_ids,
-            feature_names,
-        )
         result["reasonCodes"] = ["NO_SUCCESSFUL_TRIAL"]
         return result
 
@@ -839,12 +838,16 @@ def bqml_evaluate(body):
 
     rows = body["rows"]
 
-    # Empty rows: no metric/slice calculations. Lineage and bytes still apply.
+    # Empty rows skip aggregate/slice checks, but lineage and byte checks still apply.
     if not rows:
         if body["bytesProcessed"] > body["maxBytes"]:
             reasons.append("BYTE_LIMIT")
-        base["criticalSlicePass"] = False
+        base["criticalSlicePass"] = lineage_ok
         base["reasonCodes"] = bqml_codes(reasons)
+        if lineage_ok and body["bytesProcessed"] <= body["maxBytes"]:
+            base["decision"] = "admit"
+        else:
+            base["decision"] = "reject"
         return base
 
     all_valid = all(bqml_valid_test_row(row) for row in rows)
@@ -855,6 +858,7 @@ def bqml_evaluate(body):
             reasons.append("BYTE_LIMIT")
         base["criticalSlicePass"] = False
         base["reasonCodes"] = bqml_codes(reasons)
+        base["decision"] = "reject"
         return base
 
     correct = sum(
